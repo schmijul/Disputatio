@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Tooling and editors
+.ruff_cache/
+.mypy_cache/
+.idea/
+.vscode/
+
+# Local Disputatio data
+disputatio.db
+disputatio.db-*
+data/
+worktrees/
+
+# Environment and local logs
+.env
+.env.*
+*.log
