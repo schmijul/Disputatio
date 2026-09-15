@@ -18,7 +18,7 @@ import threading
 import tempfile
 import uuid
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping
 
@@ -372,6 +372,8 @@ class Engine:
         self._tasks: dict[str, asyncio.Task[Any]] = {}
         self._job_tasks: dict[str, asyncio.Task[Any]] = {}
         self._cancelled: set[str] = set()
+        self._sessions: dict[tuple[str, str], str] = {}
+        self._prepared: dict[str, list[dict[str, Any]]] = {}
         self._lock = asyncio.Lock()
 
     def _now(self) -> str:
@@ -380,14 +382,27 @@ class Engine:
         return str(value)
 
     async def create(self, config: Mapping[str, Any]) -> dict[str, Any]:
-        return self.store.create_run(config)
+        value = dict(config)
+        if value.get("time_limit_seconds") and not value.get("deadline"):
+            try:
+                seconds = float(value["time_limit_seconds"])
+                now = self._now()
+                stamp = datetime.fromisoformat(now.replace("Z", "+00:00")) + timedelta(seconds=seconds)
+                value["deadline"] = stamp.astimezone(timezone.utc).isoformat()
+            except (TypeError, ValueError):
+                pass
+        return self.store.create_run(value)
 
     def get(self, run_id: str) -> dict[str, Any] | None: return self.store.get_run(run_id)
     def list(self) -> list[dict[str, Any]]: return self.store.list_runs()
 
     async def start(self, run_id: str) -> dict[str, Any]:
-        run = self.store.get_run(run_id)
+        run = self.store.get_run(run_id, expanded=False)
         if run is None: raise KeyError(f"unknown run: {run_id}")
+        for other_id, other_task in self._tasks.items():
+            other = self.store.get_run(other_id, expanded=False)
+            if other_id != run_id and not other_task.done() and other and other["status"] in {"running", "pausing", "stopping"}:
+                raise RuntimeError("another run is active; pause/stop it and wait for its calls to drain")
         if run_id not in self._tasks or self._tasks[run_id].done():
             self.store.update_run(run_id, status="running", pause_reason=None, stop_reason=None)
             self._tasks[run_id] = asyncio.create_task(self._drive(run_id), name=f"disputatio:{run_id}")
@@ -416,9 +431,11 @@ class Engine:
             job = self.store.get_job(job_id)
             if job and job["run_id"] == run_id and not task.done():
                 await self._provider_cancel(job_id)
-                task.cancel()
+                if task is not asyncio.current_task():
+                    task.cancel()
         task = self._tasks.get(run_id)
-        if task and not task.done(): task.cancel()
+        if task and not task.done() and task is not asyncio.current_task():
+            task.cancel()
         self.store.update_run(run_id, status="stopped", stop_reason=reason)
         return self.store.get_run(run_id)
 
@@ -434,7 +451,7 @@ class Engine:
         if used >= limit: raise RuntimeError("agent attempt budget exhausted")
         payload = dict(original.get("payload") or {})
         payload.update({"retry_of": job_id})
-        value = self.store.create_job({"run_id": run_id, "agent_id": original["agent_id"], "phase": original["phase"], "index": original["index"], "inputs": original["inputs"], "input_ids": original["input_ids"], "payload": payload, "session_id": _id("session"), "workspace": original.get("workspace")})
+        value = self.store.create_job({"run_id": run_id, "agent_id": original["agent_id"], "phase": original["phase"], "index": original["index"], "inputs": original["inputs"], "input_ids": original["input_ids"], "input_snapshot": original.get("input_snapshot"), "prompt": original.get("prompt"), "payload": payload, "session_id": original.get("session_id"), "workspace": original.get("workspace")})
         self.store.update_run(run_id, status="running", pause_reason=None)
         self._job_tasks[value["id"]] = asyncio.create_task(self._execute(value["id"], agent, run["config"]), name=f"retry:{value['id']}")
         return value["id"]
@@ -491,20 +508,33 @@ class Engine:
             if run is None: return
             config = run["config"]
             agents = list(config.get("agents", []))
+            await self._prepare_agents(run, agents)
             # Seed jobs are created together, giving all agents an identical empty snapshot.
-            if not self.store.list_jobs(run_id):
+            seed_jobs = [j for j in self.store.list_jobs(run_id) if j["phase"] == "seed"]
+            if not seed_jobs:
                 await self._batch(run_id, config, agents, "seed", 0, [])
-            if await self._should_halt(run_id): return
+            elif any(j["status"] == "queued" for j in seed_jobs):
+                await self._run_queued_phase(run_id, config, agents, "seed")
+            if await self._should_halt(run_id):
+                await self._mark_halted(run_id)
+                return
             attempts = int(config.get("attempts", config.get("discussion_attempts", 4)))
             regular_rounds = max(0, attempts - 2)
-            for index in range(1, regular_rounds + 1):
-                if await self._should_halt(run_id): return
-                await self._batch(run_id, config, agents, "regular", index, self._transcript(run_id))
-            if await self._should_halt(run_id): return
+            await self._regular(run_id, config, agents, regular_rounds)
+            await self._checkpoint_agents(run_id, config, agents)
+            if await self._should_halt(run_id):
+                await self._mark_halted(run_id)
+                return
             regular_transcript = self._transcript(run_id)
-            await self._batch(run_id, config, agents, "closing", attempts - 1, regular_transcript)
-            if await self._should_halt(run_id): return
-            if self.worktrees is not None:
+            closing_jobs = [j for j in self.store.list_jobs(run_id) if j["phase"] == "closing"]
+            if not closing_jobs:
+                await self._batch(run_id, config, agents, "closing", attempts - 1, regular_transcript)
+            elif any(j["status"] == "queued" for j in closing_jobs):
+                await self._run_queued_phase(run_id, config, agents, "closing")
+            if await self._should_halt(run_id):
+                await self._mark_halted(run_id)
+                return
+            if self._needs_worktrees(config):
                 integrator_id = str(config.get("integrator") or agents[0].get("id"))
                 integrator = next((a for a in agents if str(a.get("id")) == integrator_id), agents[0])
                 await self._integration(run_id, config, integrator, self._transcript(run_id))
@@ -517,8 +547,136 @@ class Engine:
         except Exception as exc:
             self.store.update_run(run_id, status="partial", metadata={"error": str(exc)})
 
-    async def _should_halt(self, run_id: str) -> bool:
+    async def _mark_halted(self, run_id: str) -> None:
         run = self.store.get_run(run_id)
+        if run and run["status"] == "pausing":
+            self.store.update_run(run_id, status="paused")
+
+    def _needs_worktrees(self, config: Mapping[str, Any]) -> bool:
+        return self.worktrees is not None and any(config.get(k) for k in ("target_repo", "repository", "repo", "repo_path", "source_repo"))
+
+    async def _prepare_agents(self, run: Mapping[str, Any], agents: list[Mapping[str, Any]]) -> None:
+        if not self._needs_worktrees(run["config"]):
+            return
+        prepared = self._prepared.setdefault(str(run["id"]), [])
+        existing = {str(item.get("agent_id", item.get("id"))) for item in prepared}
+        prepare = getattr(self.worktrees, "prepare", None) or getattr(self.worktrees, "asyncprepare", None)
+        if prepare is None:
+            return
+        for agent in agents:
+            if str(agent.get("id")) in existing:
+                continue
+            try:
+                run_input = {**dict(run), **dict(run.get("config", {}))}
+                item = prepare(run_input, dict(agent))
+                if inspect.isawaitable(item): item = await item
+                if item:
+                    prepared.append(dict(item))
+            except Exception as exc:
+                self.store.add_event({"run_id": run["id"], "kind": "failure", "agent_id": agent.get("id"), "text": str(exc), "payload": {"phase": "worktree_prepare", "error": str(exc)}})
+
+    async def _checkpoint_agents(self, run_id: str, config: Mapping[str, Any], agents: list[Mapping[str, Any]]) -> None:
+        if not self._needs_worktrees(config):
+            return
+        checkpoint = getattr(self.worktrees, "checkpoint", None)
+        if checkpoint is None:
+            return
+        for item in self._prepared.get(str(run_id), []):
+            try:
+                value = checkpoint(item, testreport=item.get("testreport"), message=f"Disputatio checkpoint for {item.get('agent_id', 'agent')}")
+                if inspect.isawaitable(value): value = await value
+                if value:
+                    item.update(dict(value))
+            except Exception as exc:
+                self.store.add_event({"run_id": run_id, "kind": "failure", "agent_id": item.get("agent_id"), "text": str(exc), "payload": {"phase": "checkpoint", "error": str(exc)}})
+
+    async def _regular(self, run_id: str, config: Mapping[str, Any], agents: list[Mapping[str, Any]], rounds: int) -> None:
+        """Run regular turns as independent per-agent streams.
+
+        A completed fast agent is immediately eligible for its next turn while
+        slower agents' current calls continue.  The transcript is immutable per
+        job at creation time; notifications are therefore naturally coalesced.
+        """
+        if rounds <= 0:
+            return
+        # The run's P is the process-global discussion cap.  The constructor
+        # value is only the default for callers that omit P.
+        limit = int(config.get("max_parallel", self.max_parallel))
+        semaphore = asyncio.Semaphore(max(1, limit))
+        active: dict[asyncio.Task[Any], tuple[str, dict[str, Any]]] = {}
+
+        async def launch(agent: Mapping[str, Any], job: Mapping[str, Any]) -> None:
+            async with semaphore:
+                if await self._should_halt(run_id):
+                    return
+                await self._execute(job["id"], agent, config)
+
+        async def add(agent: Mapping[str, Any], job: dict[str, Any]) -> None:
+            task = asyncio.create_task(launch(agent, job), name=f"regular:{run_id}:{agent.get('id')}:{job['index']}")
+            active[task] = (str(agent.get("id")), job)
+            self._job_tasks[job["id"]] = task
+
+        by_id = {str(a.get("id")): a for a in agents}
+        def jobs_for(agent_id: str) -> list[dict[str, Any]]:
+            return sorted([j for j in self.store.list_jobs(run_id) if j["phase"] == "regular" and j["agent_id"] == agent_id], key=lambda j: (j["index"], j["created_at"], j["id"]))
+        for agent in agents:
+            existing = jobs_for(str(agent.get("id")))
+            queued = next((j for j in existing if j["status"] == "queued"), None)
+            if queued is not None:
+                await add(agent, queued)
+            elif not existing:
+                await add(agent, self._make_job(run_id, config, agent, "regular", 1, self._transcript(run_id)))
+        while active:
+            done, _ = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                agent_id, finished = active.pop(task)
+                try:
+                    task.result()
+                except (asyncio.CancelledError, Exception):
+                    pass
+                self._job_tasks.pop(finished["id"], None)
+            if await self._should_halt(run_id):
+                continue
+            active_agents = {value[0] for value in active.values()}
+            for agent in agents:
+                agent_id = str(agent.get("id"))
+                if agent_id in active_agents:
+                    continue
+                existing = jobs_for(agent_id)
+                latest = existing[-1] if existing else None
+                if latest is None or latest["status"] not in {"completed", "failed"} or latest["index"] >= rounds:
+                    continue
+                if self._has_foreign_public_event(latest.get("input_ids", []), agent_id, run_id):
+                    await add(by_id[agent_id], self._make_job(run_id, config, agent, "regular", latest["index"] + 1, self._transcript(run_id)))
+
+    def _has_foreign_public_event(self, input_ids: list[str], agent_id: str, run_id: str) -> bool:
+        seen = set(input_ids)
+        return any(event["id"] not in seen and event.get("kind") in {"turn", "userpost"} and event.get("agent_id") != agent_id for event in self.store.list_events(run_id))
+
+    def _make_job(self, run_id: str, config: Mapping[str, Any], agent: Mapping[str, Any], phase: str, index: int, transcript: list[dict[str, Any]]) -> dict[str, Any]:
+        context = copy.deepcopy(transcript)
+        input_ids = [x.get("id") for x in context if isinstance(x, Mapping) and x.get("id")]
+        schema = {"post": "string", "position": "string|null", "confidence": "integer 0..100|null", "diary": "string|null", "replyrefs": "array", "evidence": "array", "testreport": "object|string|null"}
+        instructions = {
+            "task": config.get("prompt", "Deliberate on the user's question."),
+            "role": agent.get("role", "participant"),
+            "phase": phase,
+            "turn_index": index,
+            "visible_transcript": context,
+            "response_schema": schema,
+        }
+        if phase == "closing":
+            instructions["task"] = "Give a final position based on the frozen regular transcript; report confidence and unresolved issues."
+        if phase == "integration":
+            instructions["task"] = "Choose the best code changes from the agent branches, merge or cherry-pick them, resolve conflicts, run tests, and report the result."
+        prompt = _json(instructions)
+        snapshot = {"run_id": run_id, "agent_id": str(agent.get("id")), "phase": phase, "index": index, "input_ids": copy.deepcopy(input_ids), "context": context, "prompt": prompt}
+        session = self._sessions.get((str(run_id), str(agent.get("id"))))
+        prepared = next((p for p in self._prepared.get(str(run_id), []) if str(p.get("agent_id")) == str(agent.get("id"))), {})
+        return self.store.create_job({"run_id": run_id, "agent_id": str(agent.get("id")), "phase": phase, "index": index, "inputs": context, "input_ids": input_ids, "input_snapshot": snapshot, "prompt": prompt, "payload": {"context": context, "config": copy.deepcopy(dict(config)), "agent": copy.deepcopy(dict(agent))}, "session_id": session, "workspace": prepared.get("workspace"), "artifacts": prepared.get("artifacts", [])})
+
+    async def _should_halt(self, run_id: str) -> bool:
+        run = self.store.get_run(run_id, expanded=False)
         if run is None or run_id in self._cancelled: return True
         if run["status"] in {"stopping", "stopped", "paused", "pausing"}: return True
         deadline = run.get("deadline")
@@ -527,19 +685,52 @@ class Engine:
             return True
         return False
 
+    def _remaining_deadline(self, run_id: str) -> float | None:
+        run = self.store.get_run(run_id, expanded=False)
+        deadline = run.get("deadline") if run else None
+        if not deadline:
+            return None
+        try:
+            end = datetime.fromisoformat(str(deadline).replace("Z", "+00:00"))
+            current = datetime.fromisoformat(self._now().replace("Z", "+00:00"))
+            return max(0.0, (end - current).total_seconds())
+        except (TypeError, ValueError):
+            return None
+
     async def _batch(self, run_id: str, config: Mapping[str, Any], agents: list[Mapping[str, Any]], phase: str, index: int, transcript: list[dict[str, Any]]) -> None:
         jobs: list[dict[str, Any]] = []
         for agent in agents:
-            context = copy.deepcopy(transcript)
-            job = self.store.create_job({"run_id": run_id, "agent_id": str(agent.get("id")), "phase": phase, "index": index, "inputs": context, "input_ids": [x.get("id") for x in context if x.get("id")], "payload": {"context": context, "config": copy.deepcopy(dict(config)), "agent": copy.deepcopy(dict(agent))}, "session_id": _id("session")})
-            jobs.append(job)
-        limit = min(self.max_parallel, int(config.get("max_parallel", self.max_parallel)))
+            jobs.append(self._make_job(run_id, config, agent, phase, index, transcript))
+        limit = int(config.get("max_parallel", self.max_parallel))
         semaphore = asyncio.Semaphore(max(1, limit))
         async def one(job: dict[str, Any]) -> None:
             async with semaphore:
+                if await self._should_halt(run_id):
+                    return
                 await self._execute(job["id"], next(a for a in agents if str(a.get("id")) == job["agent_id"]), config)
         tasks = [asyncio.create_task(one(j), name=f"job:{j['id']}") for j in jobs]
+        self._job_tasks.update({j["id"]: task for j, task in zip(jobs, tasks)})
         await asyncio.gather(*tasks, return_exceptions=True)
+        for job in jobs:
+            self._job_tasks.pop(job["id"], None)
+
+    async def _run_queued_phase(self, run_id: str, config: Mapping[str, Any], agents: list[Mapping[str, Any]], phase: str) -> None:
+        queued = [j for j in self.store.list_jobs(run_id) if j["phase"] == phase and j["status"] == "queued"]
+        if not queued:
+            return
+        limit = int(config.get("max_parallel", self.max_parallel))
+        semaphore = asyncio.Semaphore(max(1, limit))
+        by_id = {str(a.get("id")): a for a in agents}
+        async def one(job: dict[str, Any]) -> None:
+            async with semaphore:
+                if await self._should_halt(run_id):
+                    return
+                await self._execute(job["id"], by_id.get(job["agent_id"], {"id": job["agent_id"]}), config)
+        tasks = [asyncio.create_task(one(j), name=f"queued:{j['id']}") for j in queued]
+        self._job_tasks.update({j["id"]: task for j, task in zip(queued, tasks)})
+        await asyncio.gather(*tasks, return_exceptions=True)
+        for j in queued:
+            self._job_tasks.pop(j["id"], None)
 
     async def _execute(self, job_id: str, agent: Mapping[str, Any], config: Mapping[str, Any]) -> None:
         job = self.store.get_job(job_id)
@@ -547,18 +738,37 @@ class Engine:
         self.store.update_job(job_id, status="running", started_at=self._now())
         try:
             request = copy.deepcopy(job)
-            request.update({"context": copy.deepcopy(job["inputs"]), "config": copy.deepcopy(dict(config)), "agent": copy.deepcopy(dict(agent)), "session_id": job.get("session_id") or _id("session")})
+            request.update({"context": copy.deepcopy(job["inputs"]), "input_snapshot": copy.deepcopy(job.get("input_snapshot")), "prompt": job.get("prompt"), "config": copy.deepcopy(dict(config)), "agent": copy.deepcopy(dict(agent)), "session_id": job.get("session_id")})
             result = self.provider.start(request)
-            if inspect.isawaitable(result): result = await result
+            if inspect.isawaitable(result):
+                remaining = self._remaining_deadline(job["run_id"])
+                result = await asyncio.wait_for(result, remaining) if remaining is not None else await result
             if result is None: result = {}
             if not isinstance(result, Mapping): result = {"position": str(result), "raw_output": str(result)}
             result = dict(result)
-            raw = result.get("raw_output", result.get("raw", result.get("output")))
+            raw_value = result.get("raw_output", result.get("raw_stdout", result.get("raw", result.get("output"))))
+            stderr = result.get("raw_stderr")
+            raw = f"{raw_value or ''}{('\\n' + str(stderr)) if stderr else ''}" or None
             status = "failed" if result.get("ok") is False or result.get("error") else "completed"
             error = str(result.get("error")) if result.get("error") else None
-            self.store.update_job(job_id, status=status, result=result, raw_output=None if raw is None else str(raw), error=error, completed_at=self._now(), workspace=result.get("workspace"), artifacts=result.get("artifacts", []))
+            self.store.update_job(job_id, status=status, result=result, raw_output=None if raw is None else str(raw), error=error, completed_at=self._now(), session_id=result.get("session_id") or job.get("session_id"), workspace=result.get("workspace") or job.get("workspace"), artifacts=result.get("artifacts", job.get("artifacts", [])))
+            if result.get("session_id"):
+                self._sessions[(job["run_id"], job["agent_id"])] = str(result["session_id"])
             self.store.create_turn({"run_id": job["run_id"], "job_id": job_id, "agent_id": job["agent_id"], "phase": job["phase"], "index": job["index"], "status": status, "position": result.get("position", result.get("text", result.get("output"))), "confidence": result.get("confidence"), "input_ids": job["input_ids"], "at": self._now(), "raw_output": None if raw is None else str(raw)})
-            self.store.add_event({"run_id": job["run_id"], "kind": "failure" if status == "failed" else ("pass" if result.get("pass") else "turn"), "agent_id": job["agent_id"], "job_id": job_id, "text": error or result.get("position", result.get("text", result.get("output", ""))), "payload": result})
+            event_kind = "failure" if status == "failed" else ("pass" if result.get("pass") else ("ownpost" if result.get("ownpost") else "turn"))
+            self.store.add_event({"run_id": job["run_id"], "kind": event_kind, "agent_id": job["agent_id"], "job_id": job_id, "text": error or result.get("position", result.get("text", result.get("output", ""))), "payload": result})
+            self._record_diary(job, result)
+            prepared = next((p for p in self._prepared.get(str(job["run_id"]), []) if str(p.get("agent_id")) == job["agent_id"]), None)
+            if prepared is not None:
+                for key in ("testreport", "artifacts", "branch_ref", "branch"):
+                    if result.get(key) is not None:
+                        prepared[key] = copy.deepcopy(result[key])
+        except asyncio.TimeoutError:
+            await self._provider_cancel(job_id)
+            message = "provider call exceeded run deadline"
+            self.store.update_job(job_id, status="failed", completed_at=self._now(), error=message, raw_output=message)
+            self.store.create_turn({"run_id": job["run_id"], "job_id": job_id, "agent_id": job["agent_id"], "phase": job["phase"], "index": job["index"], "status": "failed", "input_ids": job["input_ids"], "at": self._now(), "raw_output": message})
+            self.store.add_event({"run_id": job["run_id"], "kind": "failure", "agent_id": job["agent_id"], "job_id": job_id, "text": message, "payload": {"error": message, "deadline": True}})
         except asyncio.CancelledError:
             self.store.update_job(job_id, status="cancelled", completed_at=self._now(), error="cancelled")
             self.store.create_turn({"run_id": job["run_id"], "job_id": job_id, "agent_id": job["agent_id"], "phase": job["phase"], "index": job["index"], "status": "cancelled", "input_ids": job["input_ids"], "at": self._now(), "raw_output": ""})
@@ -569,18 +779,44 @@ class Engine:
             self.store.create_turn({"run_id": job["run_id"], "job_id": job_id, "agent_id": job["agent_id"], "phase": job["phase"], "index": job["index"], "status": "failed", "input_ids": job["input_ids"], "at": self._now(), "raw_output": str(exc)})
             self.store.add_event({"run_id": job["run_id"], "kind": "failure", "agent_id": job["agent_id"], "job_id": job_id, "text": str(exc), "payload": {"error": str(exc)}})
 
+    def _record_diary(self, job: Mapping[str, Any], result: Mapping[str, Any]) -> None:
+        diary = result.get("diary")
+        if diary in (None, ""):
+            return
+        root = Path(tempfile.gettempdir()) / "disputatio-diaries" / str(job["run_id"])
+        root.mkdir(parents=True, exist_ok=True)
+        path = root / f"{job['agent_id']}.md"
+        path.write_text(str(diary), encoding="utf-8")
+        self.store.add_event({"run_id": job["run_id"], "kind": "diary", "agent_id": job["agent_id"], "job_id": job["id"], "text": str(path), "payload": {"path": str(path)}})
+
     async def _integration(self, run_id: str, config: Mapping[str, Any], agent: Mapping[str, Any], transcript: list[dict[str, Any]]) -> None:
+        """Create a dedicated integration worktree and one fresh provider session."""
+        run = self.store.get_run(run_id, expanded=False) or {"id": run_id, "run_id": run_id, "config": dict(config)}
+        run = {**run, **dict(config)}
+        prepared_agents = self._prepared.get(str(run_id), [])
+        integrate = getattr(self.worktrees, "integrate", None)
         prepared: dict[str, Any] = {}
-        prepare = getattr(self.worktrees, "prepare", None) or getattr(self.worktrees, "asyncprepare", None)
-        if prepare:
-            prepared = prepare(run_id, dict(agent))
-            if inspect.isawaitable(prepared): prepared = await prepared
-            prepared = dict(prepared or {})
-        request = {"run_id": run_id, "job_id": _id("integration"), "agent_id": str(agent.get("id")), "phase": "integration", "index": 0, "inputs": copy.deepcopy(transcript), "input_ids": [x.get("id") for x in transcript if x.get("id")], "context": copy.deepcopy(transcript), "config": copy.deepcopy(dict(config)), "agent": copy.deepcopy(dict(agent)), "workspace": prepared.get("workspace"), "artifacts": prepared.get("artifacts", []), "session_id": _id("session"), "branch_refs": prepared.get("branch_refs", {})}
+        if integrate is not None:
+            value = integrate(dict(run), copy.deepcopy(prepared_agents), integrator=dict(agent))
+            if inspect.isawaitable(value): value = await value
+            prepared = dict(value or {})
+        input_ids = [x.get("id") for x in transcript if isinstance(x, Mapping) and x.get("id")]
+        branches = prepared.get("source_branches", prepared.get("branch_refs", []))
+        instructions = {"task": "Choose the best changes from these agent branches, merge or cherry-pick them, resolve conflicts, run tests, and report the result.", "role": agent.get("role", "integrator"), "phase": "integration", "visible_transcript": copy.deepcopy(transcript), "branch_refs": branches, "response_schema": {"post": "string", "position": "string|null", "confidence": "integer 0..100|null", "diary": "string|null", "replyrefs": "array", "evidence": "array", "testreport": "object|string|null"}}
+        prompt = _json(instructions)
+        snapshot = {"run_id": run_id, "agent_id": str(agent.get("id")), "phase": "integration", "index": 0, "input_ids": input_ids, "context": copy.deepcopy(transcript), "prompt": prompt, "branch_refs": branches}
+        request = {"run_id": run_id, "job_id": _id("integration"), "agent_id": str(agent.get("id")), "phase": "integration", "index": 0, "inputs": copy.deepcopy(transcript), "input_ids": input_ids, "input_snapshot": snapshot, "prompt": prompt, "context": copy.deepcopy(transcript), "config": copy.deepcopy(dict(config)), "agent": copy.deepcopy(dict(agent)), "workspace": prepared.get("workspace"), "artifacts": prepared.get("artifacts", []), "session_id": None, "branch_refs": branches}
         job = self.store.create_job(request)
-        result = self.provider.start(copy.deepcopy({**job, **request}))
-        if inspect.isawaitable(result): result = await result
-        result = dict(result or {})
-        self.store.update_job(job["id"], status="completed" if not result.get("error") else "failed", result=result, raw_output=str(result.get("raw_output", result.get("output", ""))), completed_at=self._now(), workspace=prepared.get("workspace"), artifacts=result.get("artifacts", prepared.get("artifacts", [])))
-        self.store.create_turn({"run_id": run_id, "job_id": job["id"], "agent_id": agent.get("id"), "phase": "integration", "index": 0, "status": "completed" if not result.get("error") else "failed", "position": result.get("position", result.get("text", result.get("output"))), "confidence": result.get("confidence"), "input_ids": request["input_ids"], "at": self._now(), "raw_output": str(result.get("raw_output", result.get("output", "")))})
-        self.store.publish(run_id, job["id"], {"workspace": prepared.get("workspace"), "artifacts": result.get("artifacts", prepared.get("artifacts", [])), "result": result})
+        try:
+            result = self.provider.start(copy.deepcopy({**job, **request}))
+            if inspect.isawaitable(result): result = await result
+            result = dict(result or {})
+            status = "failed" if result.get("error") or result.get("ok") is False else "completed"
+            raw = result.get("raw_output", result.get("raw_stdout", result.get("output", "")))
+            self.store.update_job(job["id"], status=status, result=result, raw_output=str(raw), error=str(result["error"]) if result.get("error") else None, completed_at=self._now(), session_id=result.get("session_id"), workspace=prepared.get("workspace"), artifacts=result.get("artifacts", prepared.get("artifacts", [])))
+            self.store.create_turn({"run_id": run_id, "job_id": job["id"], "agent_id": agent.get("id"), "phase": "integration", "index": 0, "status": status, "position": result.get("position", result.get("text", result.get("output"))), "confidence": result.get("confidence"), "input_ids": input_ids, "at": self._now(), "raw_output": str(raw)})
+            self.store.add_event({"run_id": run_id, "kind": "failure" if status == "failed" else "integration", "agent_id": agent.get("id"), "job_id": job["id"], "text": result.get("error") or result.get("position", result.get("text", result.get("output", ""))), "payload": result})
+            self.store.publish(run_id, job["id"], {"workspace": prepared.get("workspace"), "artifacts": result.get("artifacts", prepared.get("artifacts", [])), "result": result, "worktree": prepared})
+        except Exception as exc:
+            self.store.update_job(job["id"], status="failed", error=str(exc), raw_output=str(exc), completed_at=self._now())
+            self.store.add_event({"run_id": run_id, "kind": "failure", "agent_id": agent.get("id"), "job_id": job["id"], "text": str(exc), "payload": {"phase": "integration", "error": str(exc)}})

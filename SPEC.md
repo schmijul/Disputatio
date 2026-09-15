@@ -8,17 +8,19 @@ Disputatio is a local, single-user web application that runs a configurable foru
 
 - A run configures `N` agents, each with a provider, model, and role. The defaults are `N = 3` and `P = 3` concurrent jobs.
 - At most `P` jobs run concurrently. Each agent has at most one active job.
+- Version one executes one discussion at a time, so its selected `P` is the process-wide cap. Other discussions remain stored; an active discussion must finish or drain its in-flight calls before another starts.
 - Agents receive four discussion attempts by default; one is reserved for the closing turn. The designated integrator receives one additional attempt.
 - Every started external call consumes an attempt, including a failed call. Calls are bounded by the run deadline.
 - A configured existing Git repository may be the target for coding work.
 
 ## Forum protocol
 
-1. Each job begins with an independent seed phase. No forum turn starts until every seed result has completed or failed.
+1. Each agent begins with one independent seed turn. No forum turn starts until every seed result has completed or failed.
 2. The asynchronous forum phase follows. Inputs for each job are frozen exactly when the job is created.
 3. Notifications are coalesced while preserving the immutable visible transcript. A closing turn sees the final regular transcript.
 4. Every completed turn records its position, self-reported confidence from 0 through 100, phase, index, time, and the IDs of its actual inputs. Missing or invalid confidence is stored as `NULL`; confidence is a self-assessment and is never a weighting signal.
 5. Passes and failures remain explicit transcript events. Raw CLI output is available alongside the visible transcript.
+6. The stored input includes the exact prompt sent to the provider: user question, agent role, phase instructions, relevant diary state, and the selected transcript. A pass or an agent's own post does not wake that same agent for another regular turn.
 
 ## Providers
 
@@ -38,6 +40,7 @@ Disputatio is a local, single-user web application that runs a configurable foru
 - Each coding agent receives a separate branch and worktree from the same base `HEAD`.
 - Checkpoint code and test artifacts are retained.
 - The integrator receives a separate result worktree and produces an integration report.
+- The result worktree initially contains the common base. The integrator receives the candidate branch references and chooses which changes to combine; the controller does not merge all alternatives automatically.
 
 ## Web interface
 

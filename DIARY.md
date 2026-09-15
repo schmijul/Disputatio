@@ -17,3 +17,10 @@
 - Early review found that the first core draft used regular-round barriers and did not yet persist provider sessions or wire per-agent worktrees. These issues were returned to its owner before completion.
 - Publishing draft work on `feat/agent-forum` for progress visibility; this branch is not yet a runnable release.
 - Backend usage-limit responses interrupted both agents. Continued only with the same requested model; no usage-reset credit was used.
+
+## 2026-09-15 — Scheduler smoke checks
+
+- A fake-provider run with three agents and four allowed attempts produced three seed calls, three passing regular turns, and three closing calls: nine calls total. Seed prompts contained the user question and agent role.
+- Eight fake agents configured with seven concurrent slots reached seven active calls, confirming that concurrency is not capped at the default of three.
+- Pausing a three-agent, one-slot run during its first seed call allowed that call to finish and dispatched no further calls. Resuming completed the remaining seeds and closing turns with six total calls and no duplicate first seed.
+- These are targeted development checks using temporary SQLite databases. Full automated regression tests and the independent package review remain in progress.
